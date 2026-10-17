@@ -107,7 +107,7 @@ class FleaMarket(commands.Cog):
                 role = "販売" if t["seller_id"] == user_id else "購入"
                 partner = t["buyer_id"] if role == "販売" else t["seller_id"]
                 lines.append(
-                    f"`#{t['id']}` 【{role}】{t['title']} — {ui.yen(t['price'])}\n"
+                    f"`#{t['guild_seq']}` 【{role}】{t['title']} — {ui.yen(t['price'])}\n"
                     f"└ {ui.TRADE_STATUS[t['status']]}・相手 <@{partner}>"
                 )
             embed.add_field(name="🔄 進行中の取引", value="\n".join(lines)[:1024], inline=False)
@@ -123,7 +123,7 @@ class FleaMarket(commands.Cog):
                     if row["message_id"]
                     else ""
                 )
-                lines.append(f"`#{row['id']}` [{row['title']}]({link}) — {ui.yen(row['price'])}")
+                lines.append(f"`#{row['guild_seq']}` [{row['title']}]({link}) — {ui.yen(row['price'])}")
             embed.add_field(name="🟢 出品中", value="\n".join(lines)[:1024], inline=False)
         else:
             embed.add_field(name="🟢 出品中", value="ありません", inline=False)

@@ -139,7 +139,7 @@ def listing_embeds(listing: Mapping[str, Any], seller_summary: Mapping[str, Any]
         value=f"<@{listing['seller_id']}>\n{rating_line(seller_summary['seller_avg'], seller_summary['seller_count'])}",
         inline=False,
     )
-    embed.set_footer(text=f"出品ID #{listing['id']}")
+    embed.set_footer(text=f"出品番号 #{listing['guild_seq']}")
 
     images: list[str] = listing["images"]
     if not images:
@@ -209,7 +209,8 @@ def panel_embed() -> discord.Embed:
             "１. 購入ボタン → 出品者にDM通知\n"
             "２. 出品者がアズカリで取引ページを作成し、URLをBotに送信 → 購入者にDM通知\n"
             "３. 商品が届いたら購入者が「受け取りました」→ 掲載終了\n"
-            "４. お互いに評価（任意）"
+            "４. お互いに評価（任意）\n\n"
+            "⚠️ 購入後のキャンセルは**相手の同意が必要**です（取り置き目的の購入はご遠慮ください）"
         ),
         color=MARKET_COLOR,
     )
@@ -227,7 +228,7 @@ def trade_embed(
     color: discord.Color = MARKET_COLOR,
 ) -> discord.Embed:
     embed = discord.Embed(title=title, description=description, color=color)
-    embed.add_field(name="商品", value=f"{listing['title']}（#{listing['id']}）", inline=False)
+    embed.add_field(name="商品", value=f"{listing['title']}（#{listing['guild_seq']}）", inline=False)
     embed.add_field(name="取引価格", value=yen(trade["price"]), inline=True)
     embed.add_field(name="出品者", value=f"<@{trade['seller_id']}>", inline=True)
     embed.add_field(name="購入者", value=f"<@{trade['buyer_id']}>", inline=True)
@@ -237,7 +238,6 @@ def trade_embed(
             value=f"https://discord.com/channels/{listing['guild_id']}/{listing['channel_id']}/{listing['message_id']}",
             inline=False,
         )
-    embed.set_footer(text=f"取引ID #{trade['id']}")
     return embed
 
 
@@ -245,13 +245,12 @@ def offer_embed(
     title: str, listing: Mapping[str, Any], offer: Mapping[str, Any], *, from_user_id: int
 ) -> discord.Embed:
     embed = discord.Embed(title=title, color=discord.Color.blurple())
-    embed.add_field(name="商品", value=f"{listing['title']}（#{listing['id']}）", inline=False)
+    embed.add_field(name="商品", value=f"{listing['title']}（#{listing['guild_seq']}）", inline=False)
     embed.add_field(name="現在の価格", value=yen(listing["price"]), inline=True)
     embed.add_field(name="提案価格", value=f"**{yen(offer['price'])}**", inline=True)
     embed.add_field(name="提案者", value=f"<@{from_user_id}>", inline=True)
     if offer["message"]:
         embed.add_field(name="メッセージ", value=offer["message"], inline=False)
-    embed.set_footer(text=f"交渉ID #{offer['id']}")
     return embed
 
 
@@ -273,7 +272,10 @@ def profile_embed(
     )
     embed.add_field(
         name="📊 取引実績",
-        value=f"販売 {summary['sold']}件 ／ 購入 {summary['bought']}件 ／ 出品中 {summary['open_listings']}件",
+        value=(
+            f"販売 {summary['sold']}件 ／ 購入 {summary['bought']}件 ／ 出品中 {summary['open_listings']}件\n"
+            f"自分から申し出たキャンセル {summary['cancels']}件"
+        ),
         inline=False,
     )
     if recent:

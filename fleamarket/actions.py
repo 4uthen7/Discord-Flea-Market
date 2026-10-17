@@ -7,6 +7,7 @@ custom_id に ID を埋め込んでいるので、Bot を再起動しても古�
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import os
 import unicodedata
@@ -26,6 +27,8 @@ log = logging.getLogger(__name__)
 ERROR_TEXT = "⚠️ エラーが発生しました。時間をおいてもう一度お試しください。"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 MAX_PRICE = 10_000_000
+# キャンセル申請に相手が返事をしないとき、申請者が単独でキャンセルできるまでの時間
+CANCEL_TIMEOUT_HOURS = int(os.getenv("CANCEL_TIMEOUT_HOURS", "72"))
 
 Handler = Callable[[discord.Interaction, int], Awaitable[Any]]
 
@@ -441,9 +444,27 @@ async def handle_manage(interaction: discord.Interaction, listing_id: int) -> No
     view.add_item(edit_button)
     view.add_item(withdraw_button)
 
+    active_trade = db.active_trade_for_listing(listing_id) if listing["status"] == "trading" else None
+    if is_admin and active_trade is not None:
+        # 当事者同士で話がつかないときの最終手段
+        force_button = discord.ui.Button(label="取引を強制キャンセル（管理者）", emoji="🛑", style=discord.ButtonStyle.danger)
+
+        async def on_force(i: discord.Interaction) -> None:
+            await i.response.edit_message(content="🛑 取引をキャンセルしました。", view=None)
+            if not await finish_cancel(
+                i.client,
+                active_trade,
+                f"サーバー管理者（<@{i.user.id}>）により取引がキャンセルされました。",
+                [active_trade["seller_id"], active_trade["buyer_id"]],
+            ):
+                await i.followup.send("この取引はすでに終了しています。", ephemeral=True)
+
+        force_button.callback = on_force
+        view.add_item(force_button)
+
     notes = {
         "open": "出品内容の編集・取り下げができます。",
-        "trading": "現在取引中のため、編集・取り下げはできません。\n取引のキャンセルはDMに届いた取引メッセージから行えます。",
+        "trading": "現在取引中のため、編集・取り下げはできません。\n取引のキャンセルは、DMの「キャンセルを申請」から相手の同意を得て行えます。",
         "sold": "この出品は取引が完了しています。",
         "withdrawn": "この出品は取り下げ済みです。",
     }
@@ -456,7 +477,7 @@ async def handle_manage(interaction: discord.Interaction, listing_id: int) -> No
 def seller_trade_view(trade_id: int) -> discord.ui.View:
     return make_view(
         action_button("tradeurl", trade_id, "取引ページURLを送る", emoji="📄", style=discord.ButtonStyle.primary),
-        action_button("tradecancel", trade_id, "取引をキャンセル", emoji="✖️", style=discord.ButtonStyle.danger),
+        action_button("tradecancel", trade_id, "キャンセルを申請", emoji="✖️", style=discord.ButtonStyle.danger),
     )
 
 
@@ -508,7 +529,7 @@ async def start_trade(
         listing,
         embed=buyer_embed,
         view=make_view(
-            action_button("tradecancel", trade_id, "取引をキャンセル", emoji="✖️", style=discord.ButtonStyle.danger)
+            action_button("tradecancel", trade_id, "キャンセルを申請", emoji="✖️", style=discord.ButtonStyle.danger)
         ),
     )
     return trade_id
@@ -541,7 +562,8 @@ async def handle_buy(interaction: discord.Interaction, listing_id: int) -> None:
         title="🛒 購入の確認",
         description=(
             f"**{listing['title']}** を **{yen(shown_price)}** で購入しますか？\n\n"
-            "確定すると出品者にDMで通知され、商品は「取引中」になります。"
+            "確定すると出品者にDMで通知され、商品は「取引中」になります。\n"
+            "⚠️ 購入後のキャンセルには**出品者の同意が必要**です。取り置き目的の購入はご遠慮ください。"
         ),
         color=ui.MARKET_COLOR,
     )
@@ -602,7 +624,7 @@ class TradeUrlModal(BaseModal, title="📄 取引ページを送る"):
         view = make_view(
             discord.ui.Button(label="取引ページを開く", emoji="🔗", url=url),
             action_button("recv", self.trade_id, "受け取りました", emoji="📦", style=discord.ButtonStyle.success),
-            action_button("tradecancel", self.trade_id, "取引をキャンセル", emoji="✖️", style=discord.ButtonStyle.danger),
+            action_button("tradecancel", self.trade_id, "キャンセルを申請", emoji="✖️", style=discord.ButtonStyle.danger),
         )
         await notify(interaction.client, trade["buyer_id"], listing, embed=embed, view=view)
 
@@ -658,7 +680,86 @@ async def handle_recv(interaction: discord.Interaction, trade_id: int) -> None:
     await notify(interaction.client, trade["seller_id"], listing, embed=seller_embed, view=rate_view(trade_id))
 
 
+def hours_since(sqlite_ts: str) -> float:
+    created = dt.datetime.strptime(sqlite_ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt.timezone.utc)
+    return (discord.utils.utcnow() - created).total_seconds() / 3600
+
+
+def cancel_answer_view(request_id: int) -> discord.ui.View:
+    return make_view(
+        action_button("cxaccept", request_id, "同意してキャンセル", emoji="✖️", style=discord.ButtonStyle.danger),
+        action_button("cxreject", request_id, "取引を続ける", emoji="🤝", style=discord.ButtonStyle.success),
+    )
+
+
+async def finish_cancel(client: discord.Client, trade: Mapping[str, Any], reason_text: str, notify_ids: list[int]) -> bool:
+    """取引をキャンセルして出品を元に戻し、関係者に知らせる。"""
+    db: Database = client.db  # type: ignore[attr-defined]
+    if not db.cancel_trade(trade["id"]):
+        return False
+    await refresh_listing(client, trade["listing_id"])
+    listing = db.get_listing(trade["listing_id"])
+    assert listing is not None
+    embed = ui.trade_embed(
+        "✖️ 取引がキャンセルされました",
+        reason_text + "\n商品は再び「出品中」に戻りました。",
+        listing,
+        db.get_trade(trade["id"]),
+        color=discord.Color.red(),
+    )
+    for user_id in notify_ids:
+        await notify(client, user_id, listing, embed=embed)
+    return True
+
+
+class CancelRequestModal(BaseModal, title="✖️ 取引キャンセルの申請"):
+    reason = discord.ui.TextInput(
+        label="キャンセルしたい理由（相手に伝わります）",
+        style=discord.TextStyle.paragraph,
+        max_length=300,
+        placeholder="例）支払い方法の都合がつかなくなったため",
+    )
+
+    def __init__(self, trade_id: int) -> None:
+        super().__init__(timeout=900)
+        self.trade_id = trade_id
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        db = db_of(interaction)
+        trade = db.get_trade(self.trade_id)
+        user_id = interaction.user.id
+        if trade is None or user_id not in (trade["seller_id"], trade["buyer_id"]):
+            return await reply(interaction, "この取引の当事者のみ操作できます。")
+        if trade["status"] not in ("requested", "page_sent"):
+            return await reply(interaction, "この取引はすでに終了しています。")
+        if db.pending_cancel_request(self.trade_id) is not None:
+            return await reply(interaction, "すでにキャンセル申請が出ています。")
+
+        reason = self.reason.value.strip()
+        request_id = db.create_cancel_request(self.trade_id, user_id, reason)
+        await reply(
+            interaction,
+            "📨 相手にキャンセル申請を送りました。相手が同意するとキャンセルされます。\n"
+            f"{CANCEL_TIMEOUT_HOURS}時間たっても返事がない場合は、もう一度「キャンセルを申請」を押すと単独でキャンセルできます。",
+        )
+        listing = db.get_listing(trade["listing_id"])
+        assert listing is not None
+        embed = ui.trade_embed(
+            "📨 取引キャンセルの申請が届きました",
+            f"<@{user_id}> さんから取引キャンセルの申請が届きました。\n"
+            "同意するとキャンセルされ、商品は「出品中」に戻ります。\n\n"
+            f"※ {CANCEL_TIMEOUT_HOURS}時間以内に返事がない場合、相手は単独でキャンセルできるようになります。",
+            listing,
+            trade,
+            color=discord.Color.orange(),
+        )
+        embed.add_field(name="理由", value=reason, inline=False)
+        other = trade["buyer_id"] if user_id == trade["seller_id"] else trade["seller_id"]
+        await notify(interaction.client, other, listing, embed=embed, view=cancel_answer_view(request_id))
+
+
 async def handle_tradecancel(interaction: discord.Interaction, trade_id: int) -> None:
+    """キャンセルは相手の同意が必要（取り置き目的の購入を防ぐため）。返事がなければ一定時間後に単独でキャンセルできる。"""
     db = db_of(interaction)
     trade = db.get_trade(trade_id)
     user_id = interaction.user.id
@@ -667,30 +768,91 @@ async def handle_tradecancel(interaction: discord.Interaction, trade_id: int) ->
     if trade["status"] not in ("requested", "page_sent"):
         return await reply(interaction, "この取引はすでに終了しています。")
 
+    pending = db.pending_cancel_request(trade_id)
+    if pending is None:
+        return await interaction.response.send_modal(CancelRequestModal(trade_id))
+
+    if pending["requester_id"] != user_id:
+        embed = discord.Embed(title="📨 相手からキャンセル申請が届いています", color=discord.Color.orange())
+        embed.add_field(name="理由", value=pending["reason"] or "（なし）", inline=False)
+        return await reply(interaction, embed=embed, view=cancel_answer_view(pending["id"]))
+
+    waited = hours_since(pending["created_at"])
+    if waited < CANCEL_TIMEOUT_HOURS:
+        deadline = discord.utils.utcnow() + dt.timedelta(hours=CANCEL_TIMEOUT_HOURS - waited)
+        return await reply(
+            interaction,
+            "⏳ キャンセル申請中です（相手の返事待ち）。\n"
+            f"返事がない場合は {discord.utils.format_dt(deadline, 'R')} から単独でキャンセルできます。",
+        )
+
     async def on_confirm(i: discord.Interaction) -> None:
-        if not db.cancel_trade(trade_id):
-            return await i.response.edit_message(content="この取引はすでに終了しています。", embed=None, view=None)
-        await i.response.edit_message(
-            content="✖️ 取引をキャンセルしました。商品は再び「出品中」に戻りました。", embed=None, view=None
-        )
-        await refresh_listing(i.client, trade["listing_id"])
-        listing = db.get_listing(trade["listing_id"])
-        assert listing is not None
+        if not db.resolve_cancel_request(pending["id"], "timeout"):
+            return await i.response.edit_message(content="この申請はすでに終了しています。", embed=None, view=None)
+        await i.response.edit_message(content="✖️ 取引をキャンセルしました。", embed=None, view=None)
         other = trade["buyer_id"] if user_id == trade["seller_id"] else trade["seller_id"]
-        embed = ui.trade_embed(
-            "✖️ 取引がキャンセルされました",
-            f"<@{user_id}> さんが取引をキャンセルしました。",
-            listing,
-            db.get_trade(trade_id),  # type: ignore[arg-type]
-            color=discord.Color.red(),
+        await finish_cancel(
+            i.client,
+            trade,
+            f"<@{user_id}> さんのキャンセル申請に{CANCEL_TIMEOUT_HOURS}時間返事がなかったため、取引はキャンセルされました。",
+            [other],
         )
-        await notify(i.client, other, listing, embed=embed)
 
     await reply(
         interaction,
-        "本当にこの取引をキャンセルしますか？\n商品は「出品中」に戻り、相手にも通知されます。",
+        f"相手から{CANCEL_TIMEOUT_HOURS}時間以上返事がないため、単独でキャンセルできます。キャンセルしますか？",
         view=ConfirmView(user_id, "キャンセルする", on_confirm, style=discord.ButtonStyle.danger),
     )
+
+
+def cancel_request_error(db: Database, request_id: int, user_id: int) -> tuple[Optional[str], Any, Any]:
+    request = db.get_cancel_request(request_id)
+    trade = db.get_trade(request["trade_id"]) if request else None
+    if request is None or trade is None:
+        return "この申請は見つかりませんでした。", None, None
+    if user_id not in (trade["seller_id"], trade["buyer_id"]) or user_id == request["requester_id"]:
+        return "この申請に返答できるのは相手の方だけです。", request, trade
+    if request["status"] != "pending" or trade["status"] not in ("requested", "page_sent"):
+        return "この申請はすでに終了しています。", request, trade
+    return None, request, trade
+
+
+async def handle_cxaccept(interaction: discord.Interaction, request_id: int) -> None:
+    db = db_of(interaction)
+    error, request, trade = cancel_request_error(db, request_id, interaction.user.id)
+    if error:
+        return await reply(interaction, error)
+    if not db.resolve_cancel_request(request_id, "accepted"):
+        return await reply(interaction, "この申請はすでに終了しています。")
+    await interaction.response.edit_message(content="✖️ キャンセルに同意しました。", view=None)
+    if not await finish_cancel(
+        interaction.client,
+        trade,
+        f"<@{interaction.user.id}> さんがキャンセル申請に同意したため、取引はキャンセルされました。",
+        [request["requester_id"]],
+    ):
+        await interaction.followup.send("この取引はすでに終了しています。")
+
+
+async def handle_cxreject(interaction: discord.Interaction, request_id: int) -> None:
+    db = db_of(interaction)
+    error, request, trade = cancel_request_error(db, request_id, interaction.user.id)
+    if error:
+        return await reply(interaction, error)
+    if not db.resolve_cancel_request(request_id, "rejected"):
+        return await reply(interaction, "この申請はすでに終了しています。")
+    await interaction.response.edit_message(content="🤝 キャンセル申請をお断りし、取引を続けます。", view=None)
+    listing = db.get_listing(trade["listing_id"])
+    assert listing is not None
+    embed = ui.trade_embed(
+        "🤝 キャンセル申請は承認されませんでした",
+        f"<@{interaction.user.id}> さんは取引の継続を希望しています。\n"
+        "話し合いで解決できない場合は、サーバーの管理者に相談してください。",
+        listing,
+        trade,
+        color=discord.Color.orange(),
+    )
+    await notify(interaction.client, request["requester_id"], listing, embed=embed)
 
 
 class RatingModal(BaseModal, title="⭐ 取引相手を評価する"):
@@ -746,7 +908,7 @@ class RatingModal(BaseModal, title="⭐ 取引相手を評価する"):
             description=f"<@{rater_id}> さんから **{ui.stars(score)}** の評価が届きました。",
             color=ui.MARKET_COLOR,
         )
-        embed.add_field(name="商品", value=f"{listing['title']}（#{listing['id']}）", inline=False)
+        embed.add_field(name="商品", value=f"{listing['title']}（#{listing['guild_seq']}）", inline=False)
         if comment:
             embed.add_field(name="コメント", value=comment, inline=False)
         items: list[discord.ui.Item] = [action_button("profile", ratee_id, "自分の評価を見る", emoji="📊", extra=listing["guild_id"])]
@@ -947,6 +1109,8 @@ HANDLERS: dict[str, Handler] = {
     "tradeurl": handle_tradeurl,
     "recv": handle_recv,
     "tradecancel": handle_tradecancel,
+    "cxaccept": handle_cxaccept,
+    "cxreject": handle_cxreject,
     "rate": handle_rate,
     "ofaccept": handle_ofaccept,
     "ofreject": handle_ofreject,

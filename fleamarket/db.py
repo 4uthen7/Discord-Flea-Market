@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS guild_settings (
 CREATE TABLE IF NOT EXISTS listings (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     guild_id    INTEGER NOT NULL,
+    guild_seq   INTEGER,                           -- サーバーごとの出品番号（画面に出すのはこちら）
     channel_id  INTEGER,
     message_id  INTEGER,
     seller_id   INTEGER NOT NULL,
@@ -69,7 +70,17 @@ CREATE TABLE IF NOT EXISTS ratings (
     UNIQUE (trade_id, rater_id)
 );
 
+CREATE TABLE IF NOT EXISTS cancel_requests (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_id     INTEGER NOT NULL REFERENCES trades(id),
+    requester_id INTEGER NOT NULL,
+    reason       TEXT    NOT NULL DEFAULT '',
+    status       TEXT    NOT NULL DEFAULT 'pending',  -- pending / accepted / rejected / timeout / admin / expired
+    created_at   TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE INDEX IF NOT EXISTS idx_ratings_ratee ON ratings (ratee_id);
+CREATE INDEX IF NOT EXISTS idx_cancel_requests_trade ON cancel_requests (trade_id);
 CREATE INDEX IF NOT EXISTS idx_trades_listing ON trades (listing_id);
 """
 
@@ -166,6 +177,25 @@ class Database:
             self.conn.executescript(SCHEMA)
             self.now_sql = "CURRENT_TIMESTAMP"
             self.integrity_errors = (sqlite3.IntegrityError,)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """古いバージョンで作ったデータベースを最新の形に合わせる。"""
+        with self.conn:
+            if self.is_postgres:
+                self.conn.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS guild_seq BIGINT")
+            else:
+                columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(listings)").fetchall()}
+                if "guild_seq" not in columns:
+                    self.conn.execute("ALTER TABLE listings ADD COLUMN guild_seq INTEGER")
+            # 番号がまだない出品に、サーバーごとの連番を振る
+            self.conn.execute(
+                "UPDATE listings SET guild_seq = (SELECT COUNT(*) FROM listings l2 "
+                "WHERE l2.guild_id = listings.guild_id AND l2.id <= listings.id) WHERE guild_seq IS NULL"
+            )
+            self.conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_listings_guild_seq ON listings (guild_id, guild_seq)"
+            )
 
     def _one(self, sql: str, params: tuple = ()) -> Optional[Any]:
         return self.conn.execute(sql, params).fetchone()
@@ -200,9 +230,10 @@ class Database:
     ) -> int:
         with self.conn:
             cur = self.conn.execute(
-                "INSERT INTO listings (guild_id, seller_id, title, price, condition, description, images) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
-                (guild_id, seller_id, title, price, condition, description, json.dumps(images)),
+                "INSERT INTO listings (guild_id, guild_seq, seller_id, title, price, condition, description, images) "
+                "VALUES (?, (SELECT COALESCE(MAX(guild_seq), 0) + 1 FROM listings WHERE guild_id = ?), ?, ?, ?, ?, ?, ?) "
+                "RETURNING id",
+                (guild_id, guild_id, seller_id, title, price, condition, description, json.dumps(images)),
             )
             return int(cur.fetchone()["id"])
 
@@ -299,9 +330,11 @@ class Database:
                     "UPDATE listings SET status = 'sold' WHERE id = (SELECT listing_id FROM trades WHERE id = ?)",
                     (trade_id,),
                 )
+                self._expire_cancel_requests(trade_id)
         return cur.rowcount == 1
 
     def cancel_trade(self, trade_id: int) -> bool:
+        """取引をキャンセルして出品を「出品中」に戻す。合意の確認は呼び出し側（キャンセル申請）で行う。"""
         with self.conn:
             cur = self.conn.execute(
                 "UPDATE trades SET status = 'cancelled' WHERE id = ? AND status IN ('requested', 'page_sent')",
@@ -313,11 +346,50 @@ class Database:
                     "WHERE id = (SELECT listing_id FROM trades WHERE id = ?) AND status = 'trading'",
                     (trade_id,),
                 )
+                self._expire_cancel_requests(trade_id)
         return cur.rowcount == 1
+
+    def _expire_cancel_requests(self, trade_id: int) -> None:
+        self.conn.execute(
+            "UPDATE cancel_requests SET status = 'expired' WHERE trade_id = ? AND status = 'pending'", (trade_id,)
+        )
+
+    # --------------------------------------------------------- cancel requests
+    def create_cancel_request(self, trade_id: int, requester_id: int, reason: str) -> int:
+        with self.conn:
+            self._expire_cancel_requests(trade_id)
+            cur = self.conn.execute(
+                "INSERT INTO cancel_requests (trade_id, requester_id, reason) VALUES (?, ?, ?) RETURNING id",
+                (trade_id, requester_id, reason),
+            )
+            return int(cur.fetchone()["id"])
+
+    def get_cancel_request(self, request_id: int) -> Optional[Any]:
+        return self._one("SELECT * FROM cancel_requests WHERE id = ?", (request_id,))
+
+    def pending_cancel_request(self, trade_id: int) -> Optional[Any]:
+        return self._one(
+            "SELECT * FROM cancel_requests WHERE trade_id = ? AND status = 'pending' ORDER BY id DESC LIMIT 1",
+            (trade_id,),
+        )
+
+    def resolve_cancel_request(self, request_id: int, status: str) -> bool:
+        """保留中の申請を accepted / rejected / timeout / admin にする。"""
+        with self.conn:
+            cur = self.conn.execute(
+                "UPDATE cancel_requests SET status = ? WHERE id = ? AND status = 'pending'", (status, request_id)
+            )
+        return cur.rowcount == 1
+
+    def active_trade_for_listing(self, listing_id: int) -> Optional[Any]:
+        return self._one(
+            "SELECT * FROM trades WHERE listing_id = ? AND status IN ('requested', 'page_sent') ORDER BY id DESC LIMIT 1",
+            (listing_id,),
+        )
 
     def active_trades_for_user(self, user_id: int) -> list[Any]:
         return self._all(
-            "SELECT t.*, l.title FROM trades t JOIN listings l ON l.id = t.listing_id "
+            "SELECT t.*, l.title, l.guild_seq FROM trades t JOIN listings l ON l.id = t.listing_id "
             "WHERE (t.seller_id = ? OR t.buyer_id = ?) AND t.status IN ('requested', 'page_sent') "
             "ORDER BY t.id DESC",
             (user_id, user_id),
@@ -391,6 +463,13 @@ class Database:
         overall_avg, overall_count = agg(None)
         seller_avg, seller_count = agg("seller")
         buyer_avg, buyer_count = agg("buyer")
+        # 自分から申し出て成立したキャンセル（取り置き目的の購入を見分ける目安）
+        cancels = self._one(
+            "SELECT COUNT(*) c FROM cancel_requests c JOIN trades t ON t.id = c.trade_id "
+            "JOIN listings l ON l.id = t.listing_id "
+            f"WHERE c.requester_id = ? AND c.status IN ('accepted', 'timeout'){guild_sql}",
+            (user_id, *guild_params),
+        )["c"]
         open_listings = self._one(
             f"SELECT COUNT(*) c FROM listings l WHERE l.seller_id = ? AND l.status = 'open'{guild_sql}",
             (user_id, *guild_params),
@@ -405,6 +484,7 @@ class Database:
             "sold": count_trades("seller_id"),
             "bought": count_trades("buyer_id"),
             "open_listings": int(open_listings),
+            "cancels": int(cancels),
         }
 
     def recent_ratings(self, user_id: int, guild_id: Optional[int] = None, limit: int = 5) -> list[Any]:

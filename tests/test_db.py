@@ -12,7 +12,7 @@ def fresh_database() -> Database:
         import psycopg
 
         with psycopg.connect(TEST_DATABASE_URL, autocommit=True) as conn:
-            conn.execute("DROP TABLE IF EXISTS ratings, offers, trades, listings, guild_settings")
+            conn.execute("DROP TABLE IF EXISTS cancel_requests, ratings, offers, trades, listings, guild_settings")
     return Database(TEST_DATABASE_URL)
 
 
@@ -90,6 +90,44 @@ class FleaMarketDbTest(unittest.TestCase):
         self.assertEqual(self.db.rating_summary(10, 2)["seller_avg"], 1)
         self.assertEqual(self.db.rating_summary(10)["seller_count"], 2)
         self.assertEqual([r["title"] for r in self.db.recent_ratings(10, 2)], ["別サーバーの商品"])
+
+    def test_listing_numbers_start_from_one_per_server(self) -> None:
+        def create(guild_id: int) -> int:
+            lid = self.db.create_listing(
+                guild_id=guild_id, seller_id=10, title="x", price=100,
+                condition="新品・未使用", description="", images=[],
+            )
+            return self.db.get_listing(lid)["guild_seq"]
+
+        self.assertEqual(self.db.get_listing(self.lid)["guild_seq"], 1)  # setUp の出品（サーバー1）
+        self.assertEqual([create(1), create(1)], [2, 3])
+        self.assertEqual([create(2), create(2)], [1, 2], "別のサーバーは #1 から始まる")
+        self.assertEqual(create(1), 4)
+
+    def test_cancel_request_flow(self) -> None:
+        tid = self.db.start_trade(self.lid, 20, 3000)
+        rid = self.db.create_cancel_request(tid, 20, "都合が悪くなった")
+        self.assertEqual(self.db.pending_cancel_request(tid)["id"], rid)
+
+        self.assertTrue(self.db.resolve_cancel_request(rid, "rejected"))
+        self.assertFalse(self.db.resolve_cancel_request(rid, "accepted"), "一度返答した申請は変えられない")
+        self.assertIsNone(self.db.pending_cancel_request(tid))
+        self.assertEqual(self.db.get_trade(tid)["status"], "requested", "拒否されたら取引は続く")
+
+        rid2 = self.db.create_cancel_request(tid, 20, "やっぱり")
+        self.assertTrue(self.db.resolve_cancel_request(rid2, "accepted"))
+        self.assertTrue(self.db.cancel_trade(tid))
+        self.assertEqual(self.db.get_listing(self.lid)["status"], "open")
+        self.assertEqual(self.db.rating_summary(20, 1)["cancels"], 1, "申し出たキャンセルが記録される")
+        self.assertEqual(self.db.rating_summary(10, 1)["cancels"], 0)
+
+    def test_completing_trade_expires_cancel_request(self) -> None:
+        tid = self.db.start_trade(self.lid, 20, 3000)
+        self.db.set_trade_url(tid, "https://azkari.jp/x")
+        rid = self.db.create_cancel_request(tid, 10, "")
+        self.assertTrue(self.db.complete_trade(tid))
+        self.assertEqual(self.db.get_cancel_request(rid)["status"], "expired")
+        self.assertEqual(self.db.active_trade_for_listing(self.lid), None)
 
     def test_large_discord_ids_and_settings(self) -> None:
         big = 1_234_567_890_123_456_789
