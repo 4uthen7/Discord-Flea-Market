@@ -104,20 +104,72 @@ async def notify(
     return False
 
 
+async def _forum_thread(client: discord.Client, channel_id: int) -> Optional[discord.Thread]:
+    channel = client.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(channel_id)
+        except discord.HTTPException:
+            return None
+    if isinstance(channel, discord.Thread) and isinstance(channel.parent, discord.ForumChannel):
+        return channel
+    return None
+
+
+async def sync_forum_thread(thread: discord.Thread, listing: Mapping[str, Any]) -> None:
+    """フォーラム投稿のタイトル・ステータスタグを更新し、終了した出品は閉じる。"""
+    forum = thread.parent
+    assert isinstance(forum, discord.ForumChannel)
+    tags = [t for t in thread.applied_tags if t.name not in ui.STATUS_TAG_NAMES]
+    if tag := ui.status_tag(forum, listing["status"]):
+        tags.append(tag)
+    kwargs: dict[str, Any] = {"applied_tags": tags[:5]}
+    name = ui.thread_name(listing)
+    if thread.name != name:  # 名前の変更はレート制限が厳しいので変わったときだけ
+        kwargs["name"] = name
+    if listing["status"] in ("sold", "withdrawn"):
+        kwargs.update(archived=True, locked=True)
+    try:
+        await thread.edit(**kwargs)
+    except discord.Forbidden:
+        # 「スレッドの管理」権限がないとロックできないので、ロックなしでもう一度
+        kwargs.pop("locked", None)
+        try:
+            await thread.edit(**kwargs)
+        except discord.HTTPException:
+            log.warning("Could not update forum thread %s", thread.id)
+    except discord.HTTPException:
+        log.warning("Could not update forum thread %s", thread.id)
+
+
 async def refresh_listing(client: discord.Client, listing_id: int) -> None:
-    """出品ページのメッセージを最新の状態に書き換える。"""
+    """出品ページのメッセージ（フォーラムなら投稿のタイトル・タグも）を最新の状態に書き換える。"""
     db: Database = client.db  # type: ignore[attr-defined]
     listing = db.get_listing(listing_id)
     if listing is None or not listing["message_id"]:
         return
+    thread = await _forum_thread(client, listing["channel_id"])
     message = client.get_partial_messageable(listing["channel_id"]).get_partial_message(listing["message_id"])
+    kwargs: dict[str, Any] = {
+        "embeds": ui.listing_embeds(listing, db.rating_summary(listing["seller_id"])),
+        "view": ui.listing_view(listing),
+    }
+    if thread is not None:
+        kwargs["content"] = ui.forum_summary(listing)
+        kwargs["allowed_mentions"] = discord.AllowedMentions.none()
+        if thread.archived and not thread.locked:
+            # しばらく発言がなく自動アーカイブされた投稿は、いったん開き直さないと編集できない
+            try:
+                await thread.edit(archived=False)
+            except discord.HTTPException:
+                log.warning("Could not unarchive forum thread %s", thread.id)
     try:
-        await message.edit(
-            embeds=ui.listing_embeds(listing, db.rating_summary(listing["seller_id"])),
-            view=ui.listing_view(listing),
-        )
+        # アーカイブ後は編集できないので、メッセージ → スレッドの順に更新する
+        await message.edit(**kwargs)
     except discord.HTTPException:
         log.warning("Could not refresh listing message #%s", listing_id)
+    if thread is not None:
+        await sync_forum_thread(thread, listing)
 
 
 class ConfirmView(discord.ui.View):
@@ -255,6 +307,9 @@ class ListingModal(BaseModal):
             channel = guild.get_channel_or_thread(market_channel_id)
         if channel is None:
             channel = interaction.channel
+            # フォーラムの投稿内で /出品 した場合は、そのフォーラムに新しい投稿を作る
+            if isinstance(channel, discord.Thread) and isinstance(channel.parent, discord.ForumChannel):
+                channel = channel.parent
 
         files: list[discord.File] = []
         names: list[str] = []
@@ -282,12 +337,29 @@ class ListingModal(BaseModal):
         )
         listing = db.get_listing(listing_id)
         assert listing is not None
+        embeds = ui.listing_embeds(listing, db.rating_summary(interaction.user.id))
         try:
-            message = await channel.send(
-                embeds=ui.listing_embeds(listing, db.rating_summary(interaction.user.id)),
-                files=files,
-                view=ui.listing_view(listing),
-            )
+            if isinstance(channel, discord.ForumChannel):
+                # フォーラムなら 1商品 = 1投稿 にする
+                tag = ui.status_tag(channel, "open")
+                created = await channel.create_thread(
+                    name=ui.thread_name(listing),
+                    auto_archive_duration=10080,
+                    content=ui.forum_summary(listing),
+                    embeds=embeds,
+                    files=files,
+                    view=ui.listing_view(listing),
+                    applied_tags=[tag] if tag else [],
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                message = created.message
+                try:
+                    # 投稿への質問が出品者に通知されるよう、出品者を投稿に参加させる
+                    await created.thread.add_user(interaction.user)
+                except discord.HTTPException:
+                    pass
+            else:
+                message = await channel.send(embeds=embeds, files=files, view=ui.listing_view(listing))
         except (discord.HTTPException, AttributeError):
             db.delete_listing(listing_id)
             await interaction.followup.send(

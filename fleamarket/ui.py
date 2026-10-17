@@ -23,6 +23,15 @@ LISTING_STATUS = {
     "withdrawn": ("⚫ 出品取り下げ", discord.Color.darker_grey()),
 }
 
+# フォーラムに出品するときに付けるステータスタグ（/フリマ設置 で自動作成）
+STATUS_TAGS = {
+    "open": ("出品中", "🟢"),
+    "trading": ("取引中", "🟡"),
+    "sold": ("SOLD", "🔴"),
+    "withdrawn": ("取り下げ", "⚫"),
+}
+STATUS_TAG_NAMES = {name for name, _ in STATUS_TAGS.values()}
+
 TRADE_STATUS = {
     "requested": "📨 取引ページ待ち",
     "page_sent": "📦 発送・受け取り待ち",
@@ -115,6 +124,22 @@ def listing_embeds(listing: Mapping[str, Any], seller_summary: Mapping[str, Any]
     return embeds
 
 
+def thread_name(listing: Mapping[str, Any]) -> str:
+    """フォーラム投稿のタイトル（一覧で価格まで見えるようにする）。"""
+    prefix = {"sold": "【SOLD】", "withdrawn": "【取り下げ】"}.get(listing["status"], "")
+    return f"{prefix}{listing['title']}　{yen(listing['price'])}"[:100]
+
+
+def forum_summary(listing: Mapping[str, Any]) -> str:
+    """フォーラム一覧のプレビューに出る1行目。"""
+    return f"💴 **{yen(listing['price'])}** ｜ 📦 {listing['condition']} ｜ 👤 出品者 <@{listing['seller_id']}>"
+
+
+def status_tag(forum: discord.ForumChannel, status: str) -> Optional[discord.ForumTag]:
+    name = STATUS_TAGS[status][0]
+    return discord.utils.get(forum.available_tags, name=name)
+
+
 def listing_view(listing: Mapping[str, Any]) -> discord.ui.View:
     lid = listing["id"]
     status = listing["status"]
@@ -143,7 +168,7 @@ def panel_embed() -> discord.Embed:
         title="🛍️ サーバーフリマ",
         description=(
             "メンバー同士で気軽に売り買いできるフリマです。\n\n"
-            "**出品する** … 下のボタンを押してフォームを埋めるだけ！\n"
+            "**出品する** … 下のボタン or `/出品` でフォームを埋めるだけ！\n"
             "**買う** … 気になる商品の「🛒 購入する」を押すと出品者にDMで通知されます\n"
             "**値下げ交渉** … 「💬 値下げ交渉」から希望価格を送れます\n"
             "**評価** … 「⭐ 出品者の評価」でいつでも確認できます\n\n"

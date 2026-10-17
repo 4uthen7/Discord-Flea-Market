@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional, Union
 
 import discord
 from discord import app_commands
@@ -16,17 +16,71 @@ class FleaMarket(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
 
-    @app_commands.command(name="フリマ設置", description="このチャンネルをフリマにして、出品ボタン付きの案内を設置します")
+    @app_commands.command(name="フリマ設置", description="フリマのチャンネル（フォーラム推奨）を設定し、出品ボタン付きの案内を設置します")
     @app_commands.guild_only()
     @app_commands.default_permissions(manage_guild=True)
-    async def setup_market(self, interaction: discord.Interaction) -> None:
-        assert interaction.guild is not None and interaction.channel is not None
-        db_of(interaction).set_market_channel(interaction.guild.id, interaction.channel.id)
-        view = ui.make_view(
+    @app_commands.rename(channel="チャンネル")
+    @app_commands.describe(channel="出品先のフォーラム or テキストチャンネル（省略すると今いるチャンネル）")
+    async def setup_market(
+        self,
+        interaction: discord.Interaction,
+        channel: Optional[Union[discord.ForumChannel, discord.TextChannel]] = None,
+    ) -> None:
+        assert interaction.guild is not None
+        target: Any = channel or interaction.channel
+        if isinstance(target, discord.Thread) and isinstance(target.parent, discord.ForumChannel):
+            target = target.parent  # フォーラムの投稿内で実行されたらそのフォーラムを使う
+        if not isinstance(target, (discord.ForumChannel, discord.TextChannel)):
+            return await reply(interaction, "⚠️ フォーラムかテキストチャンネルを指定してください。")
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        db_of(interaction).set_market_channel(interaction.guild.id, target.id)
+        sell_view = ui.make_view(
             ui.action_button("sell", 0, "出品する", emoji="📦", style=discord.ButtonStyle.success),
         )
-        await interaction.channel.send(embed=ui.panel_embed(), view=view)  # type: ignore[union-attr]
-        await reply(interaction, "✅ このチャンネルをフリマに設定しました。出品ページはここに投稿されます。")
+
+        if isinstance(target, discord.TextChannel):
+            try:
+                await target.send(embed=ui.panel_embed(), view=sell_view)
+            except discord.HTTPException:
+                await interaction.followup.send("⚠️ 案内を投稿できませんでした。Botの権限を確認してください。", ephemeral=True)
+                return
+            await interaction.followup.send(f"✅ {target.mention} をフリマに設定しました。出品ページはここに投稿されます。", ephemeral=True)
+            return
+
+        notes: list[str] = []
+        missing = [
+            discord.ForumTag(name=name, emoji=emoji)
+            for name, emoji in ui.STATUS_TAGS.values()
+            if discord.utils.get(target.available_tags, name=name) is None
+        ]
+        if missing:
+            try:
+                target = await target.edit(available_tags=[*target.available_tags, *missing])
+            except discord.HTTPException:
+                notes.append("・ステータスタグ（出品中／取引中／SOLD／取り下げ）を作成できませんでした。Botに「チャンネルの管理」権限を付けて再実行するか、手動で同名のタグを作ってください。")
+
+        try:
+            created = await target.create_thread(
+                name="📌 出品はこちら・使い方",
+                embed=ui.panel_embed(),
+                view=sell_view,
+            )
+            try:
+                await created.thread.edit(pinned=True)
+            except discord.HTTPException:
+                notes.append("・案内の投稿をピン留めできませんでした（Botに「スレッドの管理」権限が必要です）。")
+            panel = created.thread.mention
+        except discord.HTTPException:
+            panel = None
+            notes.append("・案内の投稿を作成できませんでした。`/出品` コマンドからは出品できます。")
+
+        text = f"✅ {target.mention} をフリマに設定しました。出品すると1商品ずつ新しい投稿が作られます。"
+        if panel:
+            text += f"\n案内: {panel}"
+        if notes:
+            text += "\n\n" + "\n".join(notes)
+        await interaction.followup.send(text, ephemeral=True)
 
     @app_commands.command(name="出品", description="フォームに入力して商品を出品します")
     @app_commands.guild_only()
