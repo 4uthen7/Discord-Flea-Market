@@ -1,15 +1,33 @@
+import os
 import unittest
 
 from fleamarket.db import Database
 
+# TEST_DATABASE_URL=postgresql://... を指定すると PostgreSQL でもテストできる
+TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL", ":memory:")
+
+
+def fresh_database() -> Database:
+    if TEST_DATABASE_URL.startswith(("postgres://", "postgresql://")):
+        import psycopg
+
+        with psycopg.connect(TEST_DATABASE_URL, autocommit=True) as conn:
+            conn.execute("DROP TABLE IF EXISTS ratings, offers, trades, listings, guild_settings")
+    return Database(TEST_DATABASE_URL)
+
 
 class FleaMarketDbTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.db = Database(":memory:")
+        self.db = fresh_database()
         self.lid = self.db.create_listing(
             guild_id=1, seller_id=10, title="テスト商品", price=3000,
             condition="新品・未使用", description="", images=[],
         )
+
+    def tearDown(self) -> None:
+        pool = getattr(self.db.conn, "pool", None)
+        if pool is not None:
+            pool.close()
 
     def test_purchase_flow(self) -> None:
         self.assertIsNone(self.db.start_trade(self.lid, 10, 3000), "出品者は自分の商品を買えない")
@@ -55,6 +73,12 @@ class FleaMarketDbTest(unittest.TestCase):
         buyer = self.db.rating_summary(20)
         self.assertEqual((buyer["buyer_avg"], buyer["bought"]), (4, 1))
         self.assertEqual(self.db.recent_ratings(10)[0]["title"], "テスト商品")
+
+    def test_large_discord_ids_and_settings(self) -> None:
+        big = 1_234_567_890_123_456_789
+        self.db.set_market_channel(big, big + 1)
+        self.db.set_market_channel(big, big + 2)
+        self.assertEqual(self.db.get_market_channel(big), big + 2)
 
 
 if __name__ == "__main__":

@@ -43,37 +43,59 @@ Aさん（出品者）                     Bot                         Bさん�
 | `/評価 [メンバー]` | メンバー（省略時は自分）の評価を見る |
 | `/マイ取引` | 自分の出品中の商品と進行中の取引を一覧表示 |
 
-## セットアップ
+## セットアップ（Render で無料ホスティング）
 
-### 1. Botを作成する
-1. [Discord Developer Portal](https://discord.com/developers/applications) で「New Application」
-2. 「Bot」タブで **Reset Token** してトークンをコピー
-3. 「OAuth2 → URL Generator」で以下にチェックして生成されたURLからサーバーに招待
+PCを起動しっぱなしにしなくても、Render（無料）で24時間動かせます。
+
+> **無料プランの注意点と対策（対応済み）**
+> - Render 無料プランは **15分アクセスがないとスリープ** → Bot が自分の公開URLに10分ごとにアクセスして起きたままにします
+> - Render 無料プランは **再起動・再デプロイでファイルが消える** → データは外部の無料 PostgreSQL（Neon）に保存します
+> - 無料枠は月750時間。**Render の無料 Web Service はこのBot 1つだけ**にしてください（1つなら24時間×31日に収まります）
+
+### 1. Discord Bot を作る
+1. [Discord Developer Portal](https://discord.com/developers/applications) →「New Application」
+2. 「Bot」タブ →「Reset Token」でトークンをコピー（**誰にも見せない**）
+3. 「OAuth2 → URL Generator」で以下にチェックし、生成されたURLからサーバーに招待
    - SCOPES: `bot`, `applications.commands`
    - BOT PERMISSIONS: `View Channels`, `Send Messages`, `Embed Links`, `Attach Files`, `Read Message History`
 
-特権インテント（Message Content など）は不要です。
+### 2. 無料データベース（Neon）を作る
+1. [neon.tech](https://neon.tech) に GitHub アカウントでサインアップ
+2. 「Create project」→ 名前は自由、Region は `AWS Asia Pacific (Singapore)` など近い場所
+3. ダッシュボードの「**Connect**」→ 表示される接続文字列（`postgresql://...` で始まるもの）をコピー
 
-### 2. 起動する（Python 3.10 以上）
+### 3. Render にデプロイ
+1. [render.com](https://render.com) に GitHub アカウントでサインアップ
+2. 「**New +**」→「**Blueprint**」→ このリポジトリを選択（ブランチはこのコードがあるブランチを選ぶ）
+3. 入力欄が出るので貼り付けて「Apply」
+   - `DISCORD_TOKEN` … 手順1のトークン
+   - `DATABASE_URL` … 手順2の接続文字列
+   - `GUILD_ID` … テストサーバーのID（任意。入れるとコマンドがすぐ反映される）
+4. Logs に `Logged in as ...` と出れば起動完了
+
+以降は GitHub にプッシュするたびに自動で再デプロイされます。
+
+### 4. サーバーで使い始める
+フリマ用チャンネルで `/フリマ設置` を実行すれば準備完了です。
+
+### ローカルPCで動かす場合（開発用）
 ```bash
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env               # DISCORD_TOKEN を書き込む
+cp .env.example .env               # DISCORD_TOKEN を書き込む（DATABASE_URL 未設定なら SQLite に保存）
 python bot.py
 ```
 
-> 💡 `.env` に `GUILD_ID`（サーバーID）を入れるとスラッシュコマンドがすぐ反映されます。未設定の場合、全サーバーへの反映に最大1時間ほどかかることがあります。
-
-### 3. サーバーで使い始める
-フリマ用チャンネルで `/フリマ設置` を実行すれば準備完了です。
-
 ## 補足
-- データは SQLite（既定: `fleamarket.db`）に保存されます。Botを再起動しても、過去の出品ページやDMのボタンはそのまま使えます。
+- データは `DATABASE_URL` があれば PostgreSQL、なければ SQLite（`fleamarket.db`）に保存されます。Botを再起動しても、過去の出品ページやDMのボタンはそのまま使えます。
+- Render の Logs に `429` や `1015` / `You are being rate limited` が出て起動しない場合は、Render の共有IPが Discord に一時的に制限されています。「Manual Deploy → Deploy latest commit」で再デプロイすると直ることが多いです。
 - DMを受け取らない設定のメンバーには、出品チャンネルでメンションして通知します（取引ページURLもそこに表示されるため、**サーバーメンバーからのDMを許可**しておくのがおすすめです）。
 - 同時に複数人が購入ボタンを押しても、先に確定した1人だけが取引に進みます。
 
 ## テスト
 ```bash
 python -m unittest
+# PostgreSQL でも試す場合
+TEST_DATABASE_URL=postgresql://... python -m unittest
 ```

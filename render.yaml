@@ -1,0 +1,18 @@
+# Render Blueprint（New → Blueprint でこのリポジトリを選ぶと自動で設定されます）
+services:
+  - type: web            # 無料プランで使えるのは Web Service のみ（Background Worker は有料）
+    name: discord-flea-market
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: DISCORD_TOKEN
+        sync: false      # 作成時に Render の画面で入力
+      - key: DATABASE_URL
+        sync: false      # Neon などの PostgreSQL 接続文字列
+      - key: GUILD_ID
+        sync: false      # 任意：テストサーバーのID
