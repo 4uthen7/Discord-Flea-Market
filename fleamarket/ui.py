@@ -42,6 +42,39 @@ TRADE_STATUS = {
 MARKET_COLOR = discord.Color.from_rgb(255, 112, 67)
 
 
+# 招待リンクで要求する権限（README の権限一覧と揃える）
+BOT_PERMISSIONS = discord.Permissions(
+    view_channel=True,
+    send_messages=True,
+    send_messages_in_threads=True,
+    create_public_threads=True,
+    embed_links=True,
+    attach_files=True,
+    read_message_history=True,
+    manage_threads=True,
+    manage_channels=True,
+)
+
+
+def invite_url(client_id: int) -> str:
+    return discord.utils.oauth_url(client_id, permissions=BOT_PERMISSIONS, scopes=("bot", "applications.commands"))
+
+
+def welcome_embed() -> discord.Embed:
+    return discord.Embed(
+        title="🛍️ フリマBotを導入いただきありがとうございます！",
+        description=(
+            "**はじめかた（管理者の方）**\n"
+            "１. フリマ用のフォーラムチャンネルを作る（テキストチャンネルでもOK）\n"
+            "２. `/フリマ設置 チャンネル:#そのフォーラム` を実行\n\n"
+            "これだけで、メンバーは「出品する」ボタンや `/出品` から出品できるようになります。\n\n"
+            "⚠️ このBotは代金のやり取りを行いません。支払い・発送はアズカリなどの外部サービスで行われ、"
+            "取引上のトラブルは当事者間で解決していただく形になります。サーバーのルールに禁止品などを明記しておくのがおすすめです。"
+        ),
+        color=MARKET_COLOR,
+    )
+
+
 def yen(price: int) -> str:
     return f"¥{price:,}"
 
@@ -74,11 +107,11 @@ def action_button(
     emoji: Optional[str] = None,
     style: discord.ButtonStyle = discord.ButtonStyle.secondary,
     disabled: bool = False,
+    extra: Optional[int] = None,
 ) -> discord.ui.Button:
-    """`fm:<action>:<id>` 形式の custom_id を持つ永続ボタンを作る（actions.ActionButton が処理する）。"""
-    return discord.ui.Button(
-        label=label, emoji=emoji, style=style, disabled=disabled, custom_id=f"fm:{action}:{target_id}"
-    )
+    """`fm:<action>:<id>[:<extra>]` 形式の custom_id を持つ永続ボタンを作る（actions.ActionButton が処理する）。"""
+    custom_id = f"fm:{action}:{target_id}" + (f":{extra}" if extra is not None else "")
+    return discord.ui.Button(label=label, emoji=emoji, style=style, disabled=disabled, custom_id=custom_id)
 
 
 def make_view(*items: discord.ui.Item) -> discord.ui.View:
@@ -143,7 +176,7 @@ def status_tag(forum: discord.ForumChannel, status: str) -> Optional[discord.For
 def listing_view(listing: Mapping[str, Any]) -> discord.ui.View:
     lid = listing["id"]
     status = listing["status"]
-    profile = action_button("profile", listing["seller_id"], "出品者の評価", emoji="⭐")
+    profile = action_button("profile", listing["seller_id"], "出品者の評価", emoji="⭐", extra=listing["guild_id"])
     if status in ("sold", "withdrawn"):
         return make_view(profile)
 
@@ -223,7 +256,9 @@ def offer_embed(
 
 
 # ------------------------------------------------------------------- 評価
-def profile_embed(user: discord.abc.User, summary: Mapping[str, Any], recent: list) -> discord.Embed:
+def profile_embed(
+    user: discord.abc.User, summary: Mapping[str, Any], recent: list, *, scope: str = ""
+) -> discord.Embed:
     embed = discord.Embed(
         title=f"{user.display_name} さんの評価",
         description=f"## {rating_line(summary['avg'], summary['count'])}",
@@ -251,4 +286,6 @@ def profile_embed(user: discord.abc.User, summary: Mapping[str, Any], recent: li
                 f"└ {comment} — <@{r['rater_id']}> {relative_time(r['created_at'])}"
             )
         embed.add_field(name="💬 最近の評価", value="\n".join(lines)[:1024], inline=False)
+    if scope:
+        embed.set_footer(text=scope)
     return embed

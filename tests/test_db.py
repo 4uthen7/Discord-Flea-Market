@@ -74,6 +74,23 @@ class FleaMarketDbTest(unittest.TestCase):
         self.assertEqual((buyer["buyer_avg"], buyer["bought"]), (4, 1))
         self.assertEqual(self.db.recent_ratings(10)[0]["title"], "テスト商品")
 
+    def test_ratings_are_scoped_per_server(self) -> None:
+        other = self.db.create_listing(
+            guild_id=2, seller_id=10, title="別サーバーの商品", price=1000,
+            condition="新品・未使用", description="", images=[],
+        )
+        for lid, score in ((self.lid, 5), (other, 1)):
+            tid = self.db.start_trade(lid, 20, 1000)
+            self.db.set_trade_url(tid, "https://azkari.jp/x")
+            self.db.complete_trade(tid)
+            self.db.add_rating(trade_id=tid, rater_id=20, ratee_id=10, ratee_role="seller", score=score, comment="")
+
+        self.assertEqual(self.db.rating_summary(10, 1)["seller_avg"], 5)
+        self.assertEqual(self.db.rating_summary(10, 1)["sold"], 1)
+        self.assertEqual(self.db.rating_summary(10, 2)["seller_avg"], 1)
+        self.assertEqual(self.db.rating_summary(10)["seller_count"], 2)
+        self.assertEqual([r["title"] for r in self.db.recent_ratings(10, 2)], ["別サーバーの商品"])
+
     def test_large_discord_ids_and_settings(self) -> None:
         big = 1_234_567_890_123_456_789
         self.db.set_market_channel(big, big + 1)

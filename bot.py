@@ -12,6 +12,7 @@ from aiohttp import web
 from discord.ext import commands
 from dotenv import load_dotenv
 
+from fleamarket import ui
 from fleamarket.actions import ActionButton
 from fleamarket.db import Database
 
@@ -35,7 +36,7 @@ class FleaMarketBot(commands.Bot):
         await self.load_extension("fleamarket.commands")
 
         if self.sync_guild_id:
-            # 開発用：特定サーバーにだけ即時反映
+            # 開発用：特定サーバーにだけ即時反映（他のサーバーにはコマンドが出ないので、公開時は GUILD_ID を消す）
             guild = discord.Object(id=self.sync_guild_id)
             self.tree.copy_global_to(guild=guild)
             synced = await self.tree.sync(guild=guild)
@@ -73,7 +74,21 @@ class FleaMarketBot(commands.Bot):
                 await asyncio.sleep(10 * 60)
 
     async def on_ready(self) -> None:
-        log.info("Logged in as %s (%s)", self.user, self.user.id if self.user else "?")
+        assert self.user is not None
+        log.info("Logged in as %s (%s) in %d servers", self.user, self.user.id, len(self.guilds))
+        log.info("Invite URL: %s", ui.invite_url(self.user.id))
+
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        """新しいサーバーに招待されたら、使い方を案内する。"""
+        log.info("Joined guild %s (%s)", guild.name, guild.id)
+        candidates = [guild.system_channel, *guild.text_channels]
+        for channel in candidates:
+            if channel is not None and channel.permissions_for(guild.me).send_messages:
+                try:
+                    await channel.send(embed=ui.welcome_embed())
+                except discord.HTTPException:
+                    continue
+                return
 
 
 def main() -> None:

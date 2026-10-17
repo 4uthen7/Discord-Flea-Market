@@ -68,6 +68,17 @@ def parse_price(text: str) -> Optional[int]:
     return value if 1 <= value <= MAX_PRICE else None
 
 
+# 取引ページとして想定しているサービスのドメイン（環境変数 TRUSTED_TRADE_DOMAINS で上書き可・カンマ区切り）
+TRUSTED_TRADE_DOMAINS = tuple(
+    d.strip().lower() for d in os.getenv("TRUSTED_TRADE_DOMAINS", "azkari.jp").split(",") if d.strip()
+)
+
+
+def is_trusted_trade_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return any(host == d or host.endswith("." + d) for d in TRUSTED_TRADE_DOMAINS)
+
+
 def is_valid_url(text: str) -> bool:
     parsed = urlparse(text)
     return parsed.scheme in ("http", "https") and bool(parsed.netloc) and " " not in text and len(text) <= 512
@@ -151,7 +162,7 @@ async def refresh_listing(client: discord.Client, listing_id: int) -> None:
     thread = await _forum_thread(client, listing["channel_id"])
     message = client.get_partial_messageable(listing["channel_id"]).get_partial_message(listing["message_id"])
     kwargs: dict[str, Any] = {
-        "embeds": ui.listing_embeds(listing, db.rating_summary(listing["seller_id"])),
+        "embeds": ui.listing_embeds(listing, db.rating_summary(listing["seller_id"], listing["guild_id"])),
         "view": ui.listing_view(listing),
     }
     if thread is not None:
@@ -227,13 +238,22 @@ def buyable_error(listing: Optional[Mapping[str, Any]], user_id: int) -> Optiona
     return None
 
 
-async def send_profile(interaction: discord.Interaction, user_id: int) -> None:
+async def send_profile(interaction: discord.Interaction, user_id: int, guild_id: Optional[int] = None) -> None:
+    """評価を表示する。評価はサーバーごとに分けて扱う（他サーバーでの取引は見せない）。"""
     client = interaction.client
+    guild_id = guild_id or interaction.guild_id
     user: Optional[discord.abc.User] = interaction.guild.get_member(user_id) if interaction.guild else None
     if user is None:
         user = client.get_user(user_id) or await client.fetch_user(user_id)
+    guild = client.get_guild(guild_id) if guild_id else None
+    scope = f"「{guild.name}」での評価" if guild else "参加しているサーバー全体での評価"
     db = db_of(interaction)
-    await reply(interaction, embed=ui.profile_embed(user, db.rating_summary(user_id), db.recent_ratings(user_id)))
+    await reply(
+        interaction,
+        embed=ui.profile_embed(
+            user, db.rating_summary(user_id, guild_id), db.recent_ratings(user_id, guild_id), scope=scope
+        ),
+    )
 
 
 # ======================================================================
@@ -337,7 +357,7 @@ class ListingModal(BaseModal):
         )
         listing = db.get_listing(listing_id)
         assert listing is not None
-        embeds = ui.listing_embeds(listing, db.rating_summary(interaction.user.id))
+        embeds = ui.listing_embeds(listing, db.rating_summary(interaction.user.id, guild.id))
         try:
             if isinstance(channel, discord.ForumChannel):
                 # フォーラムなら 1商品 = 1投稿 にする
@@ -428,10 +448,6 @@ async def handle_manage(interaction: discord.Interaction, listing_id: int) -> No
         "withdrawn": "この出品は取り下げ済みです。",
     }
     await reply(interaction, f"⚙️ **{listing['title']}**\n{notes[listing['status']]}", view=view)
-
-
-async def handle_profile(interaction: discord.Interaction, user_id: int) -> None:
-    await send_profile(interaction, user_id)
 
 
 # ======================================================================
@@ -571,6 +587,16 @@ class TradeUrlModal(BaseModal, title="📄 取引ページを送る"):
             db.get_trade(self.trade_id),  # type: ignore[arg-type]
             color=discord.Color.blurple(),
         )
+        host = urlparse(url).hostname or url
+        if is_trusted_trade_url(url):
+            embed.add_field(name="🔗 リンク先", value=f"✅ `{host}`", inline=False)
+        else:
+            # 偽サイトへ誘導する詐欺対策：想定外のドメインははっきり警告する
+            embed.add_field(
+                name="⚠️ リンク先にご注意ください",
+                value=f"`{host}` はアズカリ以外のURLです。\n開く前に出品者に確認し、ログイン情報やカード番号を入力しないでください。",
+                inline=False,
+            )
         if self.message.value.strip():
             embed.add_field(name="💌 出品者からのメッセージ", value=self.message.value.strip(), inline=False)
         view = make_view(
@@ -723,7 +749,7 @@ class RatingModal(BaseModal, title="⭐ 取引相手を評価する"):
         embed.add_field(name="商品", value=f"{listing['title']}（#{listing['id']}）", inline=False)
         if comment:
             embed.add_field(name="コメント", value=comment, inline=False)
-        items: list[discord.ui.Item] = [action_button("profile", ratee_id, "自分の評価を見る", emoji="📊")]
+        items: list[discord.ui.Item] = [action_button("profile", ratee_id, "自分の評価を見る", emoji="📊", extra=listing["guild_id"])]
         if not db.has_rated(self.trade_id, ratee_id):
             items.insert(0, action_button("rate", self.trade_id, "相手を評価する", emoji="⭐", style=discord.ButtonStyle.primary))
         await notify(interaction.client, ratee_id, listing, embed=embed, view=make_view(*items))
@@ -918,7 +944,6 @@ HANDLERS: dict[str, Handler] = {
     "buy": handle_buy,
     "nego": handle_nego,
     "manage": handle_manage,
-    "profile": handle_profile,
     "tradeurl": handle_tradeurl,
     "recv": handle_recv,
     "tradecancel": handle_tradecancel,
@@ -929,20 +954,27 @@ HANDLERS: dict[str, Handler] = {
 }
 
 
-class ActionButton(discord.ui.DynamicItem[discord.ui.Button], template=r"fm:(?P<action>[a-z]+):(?P<id>\d+)"):
-    def __init__(self, item: discord.ui.Button, action: str, target_id: int) -> None:
+class ActionButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"fm:(?P<action>[a-z]+):(?P<id>\d+)(?::(?P<extra>\d+))?",
+):
+    def __init__(self, item: discord.ui.Button, action: str, target_id: int, extra: Optional[int] = None) -> None:
         super().__init__(item)
         self.action = action
         self.target_id = target_id
+        self.extra = extra
 
     @classmethod
     async def from_custom_id(
         cls, interaction: discord.Interaction, item: discord.ui.Button, match: Any, /
     ) -> "ActionButton":
-        return cls(item, match["action"], int(match["id"]))
+        return cls(item, match["action"], int(match["id"]), int(match["extra"]) if match["extra"] else None)
 
     async def callback(self, interaction: discord.Interaction) -> None:
         handler = HANDLERS.get(self.action)
+        if self.action == "profile":
+            # DM から押された場合もどのサーバーの評価か分かるよう、extra にサーバーIDを入れている
+            handler = lambda i, user_id: send_profile(i, user_id, self.extra)  # noqa: E731
         if handler is None:
             return await reply(interaction, "このボタンは現在使えません。")
         try:

@@ -91,6 +91,7 @@ class FleaMarket(commands.Cog):
     @app_commands.rename(member="メンバー")
     @app_commands.describe(member="評価を見たいメンバー（省略すると自分）")
     async def rating(self, interaction: discord.Interaction, member: Optional[discord.User] = None) -> None:
+        # サーバー内ならそのサーバーでの評価、DM なら全体の評価を表示する
         await send_profile(interaction, (member or interaction.user).id)
 
     @app_commands.command(name="マイ取引", description="自分の出品中の商品と進行中の取引を確認します")
@@ -129,6 +130,12 @@ class FleaMarket(commands.Cog):
 
         embed.set_footer(text="取引の操作はDMに届いたメッセージのボタンから行えます")
         await reply(interaction, embed=embed)
+
+    @app_commands.command(name="フリマ招待", description="このフリマBotを自分のサーバーに入れるための招待リンクを表示します")
+    async def invite(self, interaction: discord.Interaction) -> None:
+        assert self.bot.user is not None
+        view = ui.make_view(discord.ui.Button(label="サーバーに追加する", emoji="➕", url=ui.invite_url(self.bot.user.id)))
+        await reply(interaction, "下のボタンから、あなたのサーバーにフリマBotを追加できます。", view=view)
 
 
 async def setup(bot: commands.Bot) -> None:

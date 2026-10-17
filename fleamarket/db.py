@@ -364,28 +364,36 @@ class Database:
     def has_rated(self, trade_id: int, rater_id: int) -> bool:
         return self._one("SELECT 1 FROM ratings WHERE trade_id = ? AND rater_id = ?", (trade_id, rater_id)) is not None
 
-    def rating_summary(self, user_id: int) -> dict[str, Any]:
+    def rating_summary(self, user_id: int, guild_id: Optional[int] = None) -> dict[str, Any]:
+        """評価の集計。guild_id を渡すとそのサーバーでの取引だけに絞る（他サーバーの評価は見せない）。"""
+        guild_sql, guild_params = ("", ()) if guild_id is None else (" AND l.guild_id = ?", (guild_id,))
+        rating_from = (
+            "FROM ratings r JOIN trades t ON t.id = r.trade_id JOIN listings l ON l.id = t.listing_id "
+            "WHERE r.ratee_id = ?" + guild_sql
+        )
+
         def agg(role: Optional[str]) -> tuple[Optional[float], int]:
-            if role is None:
-                row = self._one("SELECT AVG(score) a, COUNT(*) c FROM ratings WHERE ratee_id = ?", (user_id,))
-            else:
-                row = self._one(
-                    "SELECT AVG(score) a, COUNT(*) c FROM ratings WHERE ratee_id = ? AND ratee_role = ?",
-                    (user_id, role),
-                )
+            role_sql, role_params = ("", ()) if role is None else (" AND r.ratee_role = ?", (role,))
+            row = self._one(
+                f"SELECT AVG(r.score) a, COUNT(*) c {rating_from}{role_sql}", (user_id, *guild_params, *role_params)
+            )
             return (float(row["a"]) if row["a"] is not None else None), int(row["c"])
+
+        def count_trades(column: str) -> int:
+            return int(
+                self._one(
+                    "SELECT COUNT(*) c FROM trades t JOIN listings l ON l.id = t.listing_id "
+                    f"WHERE t.{column} = ? AND t.status = 'completed'{guild_sql}",
+                    (user_id, *guild_params),
+                )["c"]
+            )
 
         overall_avg, overall_count = agg(None)
         seller_avg, seller_count = agg("seller")
         buyer_avg, buyer_count = agg("buyer")
-        sold = self._one(
-            "SELECT COUNT(*) c FROM trades WHERE seller_id = ? AND status = 'completed'", (user_id,)
-        )["c"]
-        bought = self._one(
-            "SELECT COUNT(*) c FROM trades WHERE buyer_id = ? AND status = 'completed'", (user_id,)
-        )["c"]
         open_listings = self._one(
-            "SELECT COUNT(*) c FROM listings WHERE seller_id = ? AND status = 'open'", (user_id,)
+            f"SELECT COUNT(*) c FROM listings l WHERE l.seller_id = ? AND l.status = 'open'{guild_sql}",
+            (user_id, *guild_params),
         )["c"]
         return {
             "avg": overall_avg,
@@ -394,15 +402,16 @@ class Database:
             "seller_count": seller_count,
             "buyer_avg": buyer_avg,
             "buyer_count": buyer_count,
-            "sold": sold,
-            "bought": bought,
-            "open_listings": open_listings,
+            "sold": count_trades("seller_id"),
+            "bought": count_trades("buyer_id"),
+            "open_listings": int(open_listings),
         }
 
-    def recent_ratings(self, user_id: int, limit: int = 5) -> list[Any]:
+    def recent_ratings(self, user_id: int, guild_id: Optional[int] = None, limit: int = 5) -> list[Any]:
+        guild_sql, guild_params = ("", ()) if guild_id is None else (" AND l.guild_id = ?", (guild_id,))
         return self._all(
             "SELECT r.*, l.title FROM ratings r "
             "JOIN trades t ON t.id = r.trade_id JOIN listings l ON l.id = t.listing_id "
-            "WHERE r.ratee_id = ? ORDER BY r.id DESC LIMIT ?",
-            (user_id, limit),
+            f"WHERE r.ratee_id = ?{guild_sql} ORDER BY r.id DESC LIMIT ?",
+            (user_id, *guild_params, limit),
         )
